@@ -1,15 +1,34 @@
 diff --git a/vllm/utils/mem_utils.py b/vllm/utils/mem_utils.py
-index d954c3fd5..6233b5f75 100644
+index d954c3fd5..1756f0a73 100644
 --- a/vllm/utils/mem_utils.py
 +++ b/vllm/utils/mem_utils.py
-@@ -105,15 +105,22 @@ class MemorySnapshot:
+@@ -2,6 +2,7 @@
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ import contextlib
+ import gc
++import platform
+ import time
+ from collections.abc import Generator
+ from dataclasses import dataclass, field
+@@ -28,3 +29,9 @@ def format_gib(b: int) -> str:
++@cache
++def _is_wsl() -> bool:
++    uname = platform.uname()
++    return "microsoft" in uname.release.lower() or "microsoft" in uname.version.lower()
++
++
+ @cache
+ def get_max_shared_memory_bytes(gpu: int = 0) -> int:
+     """Returns the maximum shared memory per thread block in bytes."""
+@@ -105,15 +112,22 @@ class MemorySnapshot:
              "allocated_bytes.all.peak", 0
          )
  
 -        self.free_memory, self.total_memory = current_platform.mem_get_info(device)
 +        cuda_free_memory, self.total_memory = current_platform.mem_get_info(device)
 +        self.free_memory = cuda_free_memory
-         if current_platform.is_integrated_gpu(device.index):
+-        if current_platform.is_integrated_gpu(device.index):
++        if not _is_wsl() and current_platform.is_integrated_gpu(device.index):
              # On UMA (Unified Memory Architecture) platforms where CPU and
              # GPU share physical memory (e.g. GH200, DGX Spark, Jetson Orin),
              # cudaMemGetInfo underreports free memory because it does not
@@ -18,6 +37,7 @@ index d954c3fd5..6233b5f75 100644
 +            # Use the larger of CUDA's allocatable-device view and host
 +            # available memory. In some cases, psutil can underreport relative
 +            # to CUDA's actual allocation budget.
+             # https://docs.nvidia.com/cuda/cuda-for-tegra-appnote/#estimating-total-allocatable-device-memory-on-an-integrated-gpu-device
 -            self.free_memory = psutil.virtual_memory().available
 +            host_available_memory = psutil.virtual_memory().available
 +            self.free_memory = min(
