@@ -18,20 +18,27 @@ index d954c3fd5..1756f0a73 100644
 +
 +
  def format_kib(b: int) -> str:
-@@ -105,14 +106,25 @@ class MemorySnapshot:
+@@ -105,14 +106,32 @@ class MemorySnapshot:
              "allocated_bytes.all.peak", 0
          )
 -
 -        self.free_memory, self.total_memory = current_platform.mem_get_info(device)
 -        if current_platform.is_integrated_gpu(device.index):
 +
++        device_id = device.index if device.index is not None else 0
 +        cuda_free_memory, cuda_total_memory = current_platform.mem_get_info(device)
-+        self.free_memory = cuda_free_memory
-+        self.total_memory = cuda_total_memory
-+        # Under WSL, CUDA presents UMA hardware like a normal GPU. Keep both
-+        # free and total memory from cudaMemGetInfo, and skip host-memory
-+        # accounting entirely.
-+        if not in_wsl() and current_platform.is_integrated_gpu(device.index):
++        is_wsl = in_wsl()
++        if is_wsl:
++            self.total_memory = current_platform.get_device_total_memory(device_id)
++            self.free_memory = min(cuda_free_memory, self.total_memory)
++        else:
++            self.free_memory = cuda_free_memory
++            self.total_memory = cuda_total_memory
++
++        # Only apply host-memory UMA accounting outside WSL. Under WSL, CUDA
++        # can report UMA/system allocatable memory; treat it as a normal GPU by
++        # using device total memory above and skipping host-memory accounting.
++        if not is_wsl and current_platform.is_integrated_gpu(device_id):
              # On UMA (Unified Memory Architecture) platforms where CPU and
              # GPU share physical memory (e.g. GH200, DGX Spark, Jetson Orin),
              # cudaMemGetInfo underreports free memory because it does not
