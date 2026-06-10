@@ -1466,6 +1466,7 @@ The repository includes several pre-configured mods in the `mods/` directory:
 - **fix-qwen3.5-autoround/**, **fix-qwen3-next-autoround/**, and **fix-qwen35-tp4-marlin/**: Model-specific Qwen AutoRound and Marlin compatibility fixes.
 - **fix-qwen3-coder-next/**: Qwen3-Coder-Next runtime and performance fixes.
 - **gpu-mem-util-gb/**: Adds experimental `--gpu-memory-utilization-gb` support.
+- **uma-fix/**: Uses CUDA/NVML memory accounting under WSL and skips host-memory UMA accounting there.
 - **drop-caches/**: Periodically clears filesystem caches for large models running near the memory limit.
 - **diffusiongemma/**: Adds DiffusionGemma support, dynamic causal attention compatibility, and Gemma4 reasoning/content-channel fixes used by the DiffusionGemma recipes.
 - **nemotron-nano/** and **nemotron-super/**: Nemotron reasoning parser and model support helpers.
