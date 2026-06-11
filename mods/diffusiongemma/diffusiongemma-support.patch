@@ -3103,6 +3103,19 @@ index cf0c1d417..6a48b6282 100644
 
          # Dict to store valid cudagraph dispatching keys.
          self.cudagraph_keys: dict[CUDAGraphMode, set[BatchDescriptor]] = {
+@@ -215,7 +211,11 @@ class CudagraphDispatcher:
+             cudagraph_capture_sizes_for_decode = [
+                 x
+                 for x in self.compilation_config.cudagraph_capture_sizes
+-                if x <= max_num_tokens and x >= uniform_decode_query_len
++                if (
++                    x <= max_num_tokens
++                    and x >= uniform_decode_query_len
++                    and x % uniform_decode_query_len == 0
++                )
+             ]
+             for bs, num_active_loras in product(
+                 cudagraph_capture_sizes_for_decode, lora_cases
 diff --git a/vllm/v1/engine/core.py b/vllm/v1/engine/core.py
 index 08c814ab3..6258c8199 100644
 --- a/vllm/v1/engine/core.py
