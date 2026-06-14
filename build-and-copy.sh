@@ -37,6 +37,10 @@ PREBUILT_WHEELS_SUPPORTED_ARCHS="12.1a"
 CLEANUP_MODE="false"
 CONFIG_FILE=""
 
+# GitHub download proxy for China (prefix for all github.com URLs in curl)
+# Example: https://ghproxy.net/ or https://ghfast.top/
+GITHUB_DOWNLOAD_PROXY="${GITHUB_DOWNLOAD_PROXY:-}"
+
 cleanup() {
     if [ -n "$TMP_IMAGE" ] && [ -f "$TMP_IMAGE" ]; then
         echo "Cleaning up temporary image $TMP_IMAGE"
@@ -106,6 +110,17 @@ copy_to_host() {
     fi
 }
 
+# Proxy a GitHub URL if GITHUB_DOWNLOAD_PROXY is set
+# Usage: proxied_url=$(proxy_github_url "https://github.com/...")
+proxy_github_url() {
+    local url="$1"
+    if [ -n "$GITHUB_DOWNLOAD_PROXY" ]; then
+        echo "${GITHUB_DOWNLOAD_PROXY}${url}"
+    else
+        echo "$url"
+    fi
+}
+
 get_local_mtime() {
     local path="$1"
     stat -c %Y "$path" 2>/dev/null || stat -f %m "$path"
@@ -113,7 +128,7 @@ get_local_mtime() {
 
 get_remote_asset_mtime() {
     local url="$1"
-    curl -fsIL --connect-timeout 10 "$url" | python3 -c '
+    curl -fsIL --connect-timeout 10 "$(proxy_github_url "$url")" | python3 -c '
 import email.utils
 import sys
 
@@ -195,9 +210,9 @@ try_download_wheels() {
         return 1
     fi
 
-    local RELEASE_ASSETS_HTML
-    RELEASE_ASSETS_HTML=$(curl -sfL --connect-timeout 10 \
-        "https://github.com/$WHEELS_REPO/releases/expanded_assets/$TAG") || {
+    local RELEASE_ASSETS_HTML RELEASE_ASSETS_URL
+    RELEASE_ASSETS_URL=$(proxy_github_url "https://github.com/$WHEELS_REPO/releases/expanded_assets/$TAG")
+    RELEASE_ASSETS_HTML=$(curl -sfL --connect-timeout 10 "$RELEASE_ASSETS_URL") || {
         echo "Could not fetch release assets for '$TAG' — skipping download."
         return 1
     }
@@ -243,10 +258,10 @@ if not seen:
     sys.exit(1)
 ' "$WHEELS_REPO" "$TAG" "$PREFIX") || return 1
 
-    local RELEASE_PAGE_HTML REMOTE_COMMIT
+    local RELEASE_PAGE_HTML REMOTE_COMMIT RELEASE_PAGE_URL
     REMOTE_COMMIT=""
-    if RELEASE_PAGE_HTML=$(curl -sfL --connect-timeout 10 \
-        "https://github.com/$WHEELS_REPO/releases/tag/$TAG"); then
+    RELEASE_PAGE_URL=$(proxy_github_url "https://github.com/$WHEELS_REPO/releases/tag/$TAG")
+    if RELEASE_PAGE_HTML=$(curl -sfL --connect-timeout 10 "$RELEASE_PAGE_URL"); then
         REMOTE_COMMIT=$(printf '%s' "$RELEASE_PAGE_HTML" | python3 -c '
 import re, sys
 
@@ -338,7 +353,7 @@ if match:
         [ -z "$URL" ] && continue
         echo "Downloading $NAME..."
         TMP_WHL=$(mktemp "$WHEELS_DIR/${NAME}.XXXXXX")
-        if curl -L --progress-bar --connect-timeout 30 "$URL" -o "$TMP_WHL"; then
+        if curl -L --progress-bar --connect-timeout 30 "$(proxy_github_url "$URL")" -o "$TMP_WHL"; then
             mv "$TMP_WHL" "$WHEELS_DIR/$NAME"
             DOWNLOADED+=("$WHEELS_DIR/$NAME")
         else
@@ -389,6 +404,9 @@ usage() {
     echo "  --full-log                    : Enable full build logging (--progress=plain)"
     echo "  --no-build                    : Skip building, only copy image (requires --copy-to)"
     echo "  --network <network>           : Docker network to use during build"
+    echo "  --use-china-mirrors <0|1>     : Use Chinese mirrors for apt/pip (default: 1)"
+    echo "  --github-proxy <prefix>       : GitHub proxy prefix for git clone (e.g., https://ghfast.top/)"
+    echo "  --github-download-proxy <prefix> : GitHub proxy for release downloads (default: same as --github-proxy)"
     echo "  --cleanup                     : Remove all *.whl and *.-commit files in wheels directory"
     echo "  --config                      : Path to .env configuration file (default: .env in script directory)"
     echo "  --setup                       : Force autodiscovery and save configuration (even if .env exists)"
@@ -454,6 +472,9 @@ while [[ "$#" -gt 0 ]]; do
             ;;
         --full-log) FULL_LOG=true ;;
         --no-build) NO_BUILD=true ;;
+        --use-china-mirrors) USE_CHINA_MIRRORS="$2"; shift ;;
+        --github-proxy) GITHUB_PROXY="$2"; shift ;;
+        --github-download-proxy) GITHUB_DOWNLOAD_PROXY="$2"; shift ;;
         --cleanup) CLEANUP_MODE=true ;;
         --network)
             if [ -n "$2" ] && [[ "$2" != -* ]]; then
@@ -534,8 +555,7 @@ if [ "$EXP_MXFP4" = true ]; then
     if [ "$VLLM_REF_SET" = true ]; then echo "Error: --exp-mxfp4 is incompatible with --vllm-ref"; exit 1; fi
     if [ "$FLASHINFER_REF_SET" = true ]; then echo "Error: --exp-mxfp4 is incompatible with --flashinfer-ref"; exit 1; fi
     if [ "$PRE_TRANSFORMERS" = true ]; then echo "Error: --exp-mxfp4 is incompatible with --tf5"; exit 1; fi
-    if [ "$REBUILD_FLASHINFER" = true ]; then echo "Error: --exp-mxfp4 is incompatible with --rebuild-flashinfer"; exit 1; fi
-    if [ "$REBUILD_VLLM" = true ]; then echo "Error: --exp-mxfp4 is incompatible with --rebuild-vllm"; exit 1; fi
+    # --rebuild-flashinfer and --rebuild-vllm are now supported for MXFP4
 fi
 
 # Validate --no-build usage
@@ -579,6 +599,20 @@ fi
 COMMON_BUILD_FLAGS+=("--build-arg" "BUILD_JOBS=$BUILD_JOBS")
 COMMON_BUILD_FLAGS+=("--build-arg" "TORCH_CUDA_ARCH_LIST=$GPU_ARCH_LIST")
 COMMON_BUILD_FLAGS+=("--build-arg" "FLASHINFER_CUDA_ARCH_LIST=$GPU_ARCH_LIST")
+
+# China mirror support
+CHINA_MIRRORS="${USE_CHINA_MIRRORS:-1}"
+COMMON_BUILD_FLAGS+=("--build-arg" "USE_CHINA_MIRRORS=$CHINA_MIRRORS")
+if [ "$CHINA_MIRRORS" = "1" ]; then
+    COMMON_BUILD_FLAGS+=("--build-arg" "PYTORCH_INDEX_URL=https://mirrors.tuna.tsinghua.edu.cn/pytorch/whl/cu130")
+    # Auto-enable GitHub download proxy for China if not explicitly set
+    GITHUB_DOWNLOAD_PROXY="${GITHUB_DOWNLOAD_PROXY:-https://ghfast.top/}"
+    GITHUB_PROXY="${GITHUB_PROXY:-https://ghfast.top/}"
+fi
+if [ -n "$GITHUB_PROXY" ]; then
+    COMMON_BUILD_FLAGS+=("--build-arg" "GITHUB_PROXY=$GITHUB_PROXY")
+fi
+
 if [ -n "$NETWORK_ARG" ]; then
     COMMON_BUILD_FLAGS+=("--network" "$NETWORK_ARG")
 fi
@@ -594,18 +628,126 @@ if [ "$NO_BUILD" = false ]; then
     if [ "$EXP_MXFP4" = true ]; then
         echo "Building with experimental MXFP4 support..."
 
-        # Generate build metadata YAML for mxfp4 build
-        MXFP4_VLLM_SHA=$(grep -m1 '^ARG VLLM_SHA=' Dockerfile.mxfp4 | cut -d= -f2)
+        # ========================================================
+        # MXFP4 Phase 1: FlashInfer wheels
+        # ========================================================
         MXFP4_FLASHINFER_SHA=$(grep -m1 '^ARG FLASHINFER_SHA=' Dockerfile.mxfp4 | cut -d= -f2)
-        generate_build_metadata Dockerfile.mxfp4 "unknown" "$MXFP4_VLLM_SHA" "$MXFP4_FLASHINFER_SHA" \
+        MXFP4_VLLM_SHA=$(grep -m1 '^ARG VLLM_SHA=' Dockerfile.mxfp4 | cut -d= -f2)
+
+        BUILD_FLASHINFER=false
+        if [ "$REBUILD_FLASHINFER" = true ]; then
+            echo "Force rebuilding MXFP4 FlashInfer wheels..."
+            rm -f ./wheels/flashinfer*.whl ./wheels/.flashinfer-commit
+            BUILD_FLASHINFER=true
+        elif compgen -G "./wheels/flashinfer*.whl" > /dev/null 2>&1; then
+            # Check if existing wheels are from mxfp4 build
+            if [ -f "./wheels/.flashinfer-commit" ]; then
+                EXISTING_FI_COMMIT=$(cat "./wheels/.flashinfer-commit")
+                if [ "$EXISTING_FI_COMMIT" = "$MXFP4_FLASHINFER_SHA" ]; then
+                    echo "MXFP4 FlashInfer wheels already exist (commit matches) — skipping build."
+                else
+                    echo "Existing FlashInfer wheels are from a different build (commit $EXISTING_FI_COMMIT vs $MXFP4_FLASHINFER_SHA) — rebuilding..."
+                    rm -f ./wheels/flashinfer*.whl ./wheels/.flashinfer-commit
+                    BUILD_FLASHINFER=true
+                fi
+            else
+                echo "Existing FlashInfer wheels (unknown origin) — rebuilding for MXFP4..."
+                rm -f ./wheels/flashinfer*.whl
+                BUILD_FLASHINFER=true
+            fi
+        else
+            echo "No MXFP4 FlashInfer wheels found — building..."
+            BUILD_FLASHINFER=true
+        fi
+
+        if [ "$BUILD_FLASHINFER" = true ]; then
+            FI_MXFP4_CMD=("docker" "build"
+                "--target" "flashinfer-export"
+                "--output" "type=local,dest=./wheels"
+                "${COMMON_BUILD_FLAGS[@]}"
+                "-f" "Dockerfile.mxfp4")
+            if [ "$REBUILD_FLASHINFER" = true ]; then
+                FI_MXFP4_CMD+=("--build-arg" "CACHEBUST_FLASHINFER=$(date +%s)")
+            fi
+            FI_MXFP4_CMD+=(".")
+            echo "MXFP4 FlashInfer build command: ${FI_MXFP4_CMD[*]}"
+            FI_START=$(date +%s)
+            "${FI_MXFP4_CMD[@]}"
+            FI_END=$(date +%s)
+            FLASHINFER_BUILD_TIME=$((FI_END - FI_START))
+        fi
+
+        # ========================================================
+        # MXFP4 Phase 2: vLLM wheels
+        # ========================================================
+        BUILD_VLLM=false
+        if [ "$REBUILD_VLLM" = true ]; then
+            echo "Force rebuilding MXFP4 vLLM wheels..."
+            rm -f ./wheels/vllm*.whl ./wheels/.vllm-commit
+            BUILD_VLLM=true
+        elif compgen -G "./wheels/vllm*.whl" > /dev/null 2>&1; then
+            if [ -f "./wheels/.vllm-commit" ]; then
+                EXISTING_VLLM_COMMIT=$(cat "./wheels/.vllm-commit")
+                if [ "$EXISTING_VLLM_COMMIT" = "$MXFP4_VLLM_SHA" ]; then
+                    echo "MXFP4 vLLM wheels already exist (commit matches) — skipping build."
+                else
+                    echo "Existing vLLM wheels are from a different build (commit $EXISTING_VLLM_COMMIT vs $MXFP4_VLLM_SHA) — rebuilding..."
+                    rm -f ./wheels/vllm*.whl ./wheels/.vllm-commit
+                    BUILD_VLLM=true
+                fi
+            else
+                echo "Existing vLLM wheels (unknown origin) — rebuilding for MXFP4..."
+                rm -f ./wheels/vllm*.whl
+                BUILD_VLLM=true
+            fi
+        else
+            echo "No MXFP4 vLLM wheels found — building..."
+            BUILD_VLLM=true
+        fi
+
+        if [ "$BUILD_VLLM" = true ]; then
+            VLLM_MXFP4_CMD=("docker" "build"
+                "--target" "vllm-export"
+                "--output" "type=local,dest=./wheels"
+                "${COMMON_BUILD_FLAGS[@]}"
+                "-f" "Dockerfile.mxfp4")
+            if [ "$REBUILD_VLLM" = true ]; then
+                VLLM_MXFP4_CMD+=("--build-arg" "CACHEBUST_VLLM=$(date +%s)")
+            fi
+            VLLM_MXFP4_CMD+=(".")
+            echo "MXFP4 vLLM build command: ${VLLM_MXFP4_CMD[*]}"
+            VLLM_START=$(date +%s)
+            "${VLLM_MXFP4_CMD[@]}"
+            VLLM_END=$(date +%s)
+            VLLM_BUILD_TIME=$((VLLM_END - VLLM_START))
+        fi
+
+        # ========================================================
+        # MXFP4 Phase 3: Runner image
+        # ========================================================
+        if ! compgen -G "./wheels/*.whl" > /dev/null 2>&1; then
+            echo "Error: No wheel files found in ./wheels/ — cannot build runner image."
+            exit 1
+        fi
+
+        # Generate build metadata YAML for mxfp4 build
+        VLLM_COMMIT=""
+        [ -f "./wheels/.vllm-commit" ] && VLLM_COMMIT=$(cat ./wheels/.vllm-commit)
+        FLASHINFER_COMMIT=""
+        [ -f "./wheels/.flashinfer-commit" ] && FLASHINFER_COMMIT=$(cat ./wheels/.flashinfer-commit)
+        generate_build_metadata Dockerfile.mxfp4 "unknown" "$VLLM_COMMIT" "$FLASHINFER_COMMIT" \
             "mxfp4-pinned" "false" "true" ""
 
-        CMD=("docker" "build" "-t" "$IMAGE_TAG" "${COMMON_BUILD_FLAGS[@]}" "-f" "Dockerfile.mxfp4" ".")
-        echo "Building image with command: ${CMD[*]}"
-        BUILD_START=$(date +%s)
-        "${CMD[@]}"
-        BUILD_END=$(date +%s)
-        RUNNER_BUILD_TIME=$((BUILD_END - BUILD_START))
+        RUNNER_CMD=("docker" "build"
+            "-t" "$IMAGE_TAG"
+            "${COMMON_BUILD_FLAGS[@]}"
+            "-f" "Dockerfile.mxfp4"
+            ".")
+        echo "MXFP4 runner build command: ${RUNNER_CMD[*]}"
+        RUNNER_START=$(date +%s)
+        "${RUNNER_CMD[@]}"
+        RUNNER_END=$(date +%s)
+        RUNNER_BUILD_TIME=$((RUNNER_END - RUNNER_START))
     else
         # ----------------------------------------------------------
         # Phase 1: FlashInfer wheels

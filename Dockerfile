@@ -4,6 +4,13 @@
 ARG BUILD_JOBS=16
 ARG CUDA_IMAGE=nvidia/cuda:13.0.2-devel-ubuntu24.04
 
+# China mirror support — set to 1 to use Chinese mirrors for apt/pip/git/hf
+ARG USE_CHINA_MIRRORS=1
+# PyTorch wheel index URL (use Tsinghua mirror for China)
+ARG PYTORCH_INDEX_URL=https://mirrors.tuna.tsinghua.edu.cn/pytorch/whl/cu130
+# GitHub proxy prefix for git clone (empty = direct; set to https://ghproxy.net/ for China)
+ARG GITHUB_PROXY=
+
 # =========================================================
 # STAGE 1: Base Build Image
 # =========================================================
@@ -37,6 +44,28 @@ ENV UV_HTTP_RETRIES=10
 # Set the base directory environment variable
 ENV VLLM_BASE_DIR=/workspace/vllm
 
+# =========================================================
+# China Mirror Configuration (apt + pip + uv + hf)
+# =========================================================
+ARG USE_CHINA_MIRRORS
+ARG GITHUB_PROXY
+ARG PYTORCH_INDEX_URL
+
+# Configure apt mirrors (Aliyun)
+RUN if [ "$USE_CHINA_MIRRORS" = "1" ]; then \
+        echo "Configuring Chinese mirrors..." && \
+        sed -i 's|http://archive.ubuntu.com|http://mirrors.aliyun.com|g' /etc/apt/sources.list.d/ubuntu.sources && \
+        sed -i 's|http://ports.ubuntu.com|http://mirrors.aliyun.com|g' /etc/apt/sources.list.d/ubuntu.sources && \
+        sed -i 's|http://security.ubuntu.com|http://mirrors.aliyun.com|g' /etc/apt/sources.list.d/ubuntu.sources; \
+    fi
+
+# Configure pip mirror (Tsinghua)
+ENV PIP_INDEX_URL=https://mirrors.aliyun.com/pypi/simple/
+ENV UV_DEFAULT_INDEX=${PIP_INDEX_URL}
+
+# Configure HuggingFace mirror
+ENV HF_ENDPOINT=https://hf-mirror.com
+
 # 1. Install Build Dependencies & Ccache
 # Added ccache to enable incremental compilation caching
 RUN apt update && \
@@ -47,11 +76,16 @@ RUN apt update && \
     libibverbs1 libibverbs-dev rdma-core \
     ccache devscripts debhelper fakeroot \
     && rm -rf /var/lib/apt/lists/* \
-    && pip install uv
+    && pip install uv \
+    && if [ -n "$GITHUB_PROXY" ]; then \
+        git config --global url."${GITHUB_PROXY}https://github.com/".insteadOf "https://github.com/"; \
+        echo "Git proxy: ${GITHUB_PROXY}"; \
+    fi
 
 # Additional deps
+ARG PYTORCH_INDEX_URL
 RUN --mount=type=cache,id=uv-cache,target=/root/.cache/uv \
-     uv pip install torch==2.11.0 torchvision torchaudio triton --index-url https://download.pytorch.org/whl/cu130 && \
+     uv pip install torch==2.11.0 torchvision torchaudio triton --index-url ${PYTORCH_INDEX_URL} && \
      uv pip install nvidia-nvshmem-cu13 "apache-tvm-ffi<0.2" filelock pynvml requests tqdm
 
 # Configure Ccache for CUDA/C++
@@ -78,7 +112,7 @@ WORKDIR $VLLM_BASE_DIR
 #     cd nccl && make -j ${BUILD_JOBS} src.build NVCC_GENCODE="-gencode=arch=compute_121,code=sm_121" && \
 #     make pkg.debian.build && apt install -y --no-install-recommends --allow-downgrades ./build/pkg/deb/*.deb
 
-RUN git clone -b v2.30u1 https://github.com/NVIDIA/nccl.git && \
+RUN git clone -b v2.30u1 ${GITHUB_PROXY}https://github.com/NVIDIA/nccl.git && \
     cd nccl && make -j ${BUILD_JOBS} src.build NVCC_GENCODE="-gencode=arch=compute_121,code=sm_121" && \
     make pkg.debian.build && apt install -y --no-install-recommends --allow-downgrades --allow-change-held-packages ./build/pkg/deb/*.deb
 
@@ -101,11 +135,12 @@ RUN --mount=type=cache,id=uv-cache,target=/root/.cache/uv \
      uv pip install packaging
 
 # Smart Git Clone (Fetch changes instead of full re-clone)
+ARG GITHUB_PROXY
 RUN --mount=type=cache,id=repo-cache,target=/repo-cache \
     cd /repo-cache && \
     if [ ! -d "flashinfer" ]; then \
         echo "Cache miss: Cloning FlashInfer from scratch..." && \
-        git clone --recursive https://github.com/flashinfer-ai/flashinfer.git; \
+        git clone --recursive ${GITHUB_PROXY}https://github.com/flashinfer-ai/flashinfer.git; \
         if [ "$FLASHINFER_REF" != "main" ]; then \
             cd flashinfer && \
             git checkout ${FLASHINFER_REF}; \
@@ -188,11 +223,12 @@ ARG CACHEBUST_VLLM=1
 ARG VLLM_REF=main
 
 # Smart Git Clone (Fetch changes instead of full re-clone)
+ARG GITHUB_PROXY
 RUN --mount=type=cache,id=repo-cache,target=/repo-cache \
     cd /repo-cache && \
     if [ ! -d "vllm" ]; then \
         echo "Cache miss: Cloning vLLM from scratch..." && \
-        git clone --recursive https://github.com/vllm-project/vllm.git; \
+        git clone --recursive ${GITHUB_PROXY}https://github.com/vllm-project/vllm.git; \
         if [ "$VLLM_REF" != "main" ]; then \
             cd vllm && \
             git checkout ${VLLM_REF}; \
@@ -315,6 +351,11 @@ COPY --from=vllm-builder /workspace/wheels /
 # =========================================================
 FROM ${CUDA_IMAGE} AS runner
 
+# Re-declare args for this stage
+ARG USE_CHINA_MIRRORS
+ARG PYTORCH_INDEX_URL
+ARG GITHUB_PROXY
+
 # Transferring build settings from build image because of ptxas/jit compilation during vLLM startup
 # Build parallemism
 ARG BUILD_JOBS
@@ -335,6 +376,19 @@ ENV UV_CACHE_DIR=/root/.cache/uv
 ENV UV_SYSTEM_PYTHON=1
 ENV UV_BREAK_SYSTEM_PACKAGES=1
 ENV UV_LINK_MODE=copy
+
+# Configure Chinese mirrors for runner
+RUN if [ "$USE_CHINA_MIRRORS" = "1" ]; then \
+        echo "Configuring Chinese mirrors in runner..." && \
+        sed -i 's|http://archive.ubuntu.com|http://mirrors.aliyun.com|g' /etc/apt/sources.list.d/ubuntu.sources && \
+        sed -i 's|http://ports.ubuntu.com|http://mirrors.aliyun.com|g' /etc/apt/sources.list.d/ubuntu.sources && \
+        sed -i 's|http://security.ubuntu.com|http://mirrors.aliyun.com|g' /etc/apt/sources.list.d/ubuntu.sources; \
+    fi
+
+# Configure pip mirror and HF endpoint
+ENV PIP_INDEX_URL=https://mirrors.aliyun.com/pypi/simple/
+ENV UV_DEFAULT_INDEX=${PIP_INDEX_URL}
+ENV HF_ENDPOINT=https://hf-mirror.com
 
 # Mount additional packages from base builder image
 # Install runtime dependencies
@@ -360,12 +414,15 @@ RUN mkdir -p tiktoken_encodings && \
 ARG PRE_TRANSFORMERS=0
 
 # Install deps
+ARG PYTORCH_INDEX_URL
 RUN --mount=type=cache,id=uv-cache,target=/root/.cache/uv \
-     uv pip install torch==2.11.0 torchvision torchaudio triton --index-url https://download.pytorch.org/whl/cu130 && \
+     uv pip install torch==2.11.0 torchvision torchaudio triton --index-url ${PYTORCH_INDEX_URL} && \
      uv pip install nvidia-nvshmem-cu13 "apache-tvm-ffi<0.2"
 
 # Install wheels from host ./wheels/ (bind-mounted from build context — no layer bloat)
 # With --tf5: override vLLM's transformers<5 constraint to get transformers>=5
+# Use official PyTorch index for CUDA torch version resolution (only metadata, no re-download)
+ARG PYTORCH_INDEX_URL
 RUN --mount=type=bind,source=wheels,target=/workspace/wheels \
     --mount=type=cache,id=uv-cache,target=/root/.cache/uv \
     PINNED_TORCH=$(python3 -c "import torch; print(torch.__version__)") && \
@@ -373,7 +430,9 @@ RUN --mount=type=bind,source=wheels,target=/workspace/wheels \
     if [ "$PRE_TRANSFORMERS" = "1" ]; then \
         echo "transformers>=5.0.0" >> /tmp/wheel-override.txt; \
     fi && \
-    uv pip install /workspace/wheels/*.whl --override /tmp/wheel-override.txt
+    uv pip install /workspace/wheels/*.whl --override /tmp/wheel-override.txt \
+        --extra-index-url https://download.pytorch.org/whl/cu130 \
+        --index-strategy unsafe-best-match
 
 # Setup environment for runtime
 ARG TORCH_CUDA_ARCH_LIST="12.1a"
@@ -388,11 +447,14 @@ ENV PATH=$VLLM_BASE_DIR:$PATH
 # Final extra deps
 # Pin torch via --override so transitive deps (e.g. instanttensor) can't trigger
 # a re-resolve that swaps the CUDA-built torch for PyPI's CPU wheel.
+# Use official PyTorch index for CUDA torch version resolution.
 RUN --mount=type=cache,id=uv-cache,target=/root/.cache/uv \
     PINNED_TORCH=$(python3 -c "import torch; print(torch.__version__)") && \
     echo "torch==${PINNED_TORCH}" > /tmp/torch-override.txt && \
     uv pip install ray[default] fastsafetensors instanttensor \
-        --override /tmp/torch-override.txt
+        --override /tmp/torch-override.txt \
+        --extra-index-url https://download.pytorch.org/whl/cu130 \
+        --index-strategy unsafe-best-match
 
 # Fix NCCL
 RUN rm /usr/local/lib/python3.12/dist-packages/nvidia/nccl/lib/libnccl.so.2 && \

@@ -10,6 +10,12 @@ PARALLEL_COPY=false
 CONFIG_FILE=""
 CONFIG_FILE_SET=false
 
+# China mirror support
+USE_CHINA_MIRROR="${HF_CHINA_MIRROR:-1}"
+if [ "$USE_CHINA_MIRROR" = "1" ]; then
+    export HF_ENDPOINT="${HF_ENDPOINT:-https://hf-mirror.com}"
+fi
+
 # Help function
 usage() {
     echo "Usage: $0 [OPTIONS] <model-name>"
@@ -17,6 +23,8 @@ usage() {
     echo "  -c, --copy-to <hosts>       : Host(s) to copy the model to. Accepts comma or space-delimited lists after the flag."
     echo "      --copy-to-host          : Alias for --copy-to (backwards compatibility)."
     echo "      --copy-parallel         : Copy to all hosts in parallel instead of serially."
+    echo "  --no-china-mirror           : Disable HuggingFace China mirror (hf-mirror.com)"
+    echo "  --hf-endpoint <url>         : Custom HuggingFace endpoint (default: https://hf-mirror.com in China)"
     echo "  -u, --user <user>           : Username for ssh commands (default: \$USER)"
     echo "  --config <file>             : Path to .env configuration file (default: .env in script directory)"
     echo "  -h, --help                  : Show this help message"
@@ -70,6 +78,8 @@ while [[ "$#" -gt 0 ]]; do
             continue
             ;;
         --copy-parallel) PARALLEL_COPY=true ;;
+        --no-china-mirror) USE_CHINA_MIRROR=0 ;;
+        --hf-endpoint) export HF_ENDPOINT="$2"; USE_CHINA_MIRROR=0; shift ;;
         -u|--user) SSH_USER="$2"; shift ;;
         --config) CONFIG_FILE="$2"; CONFIG_FILE_SET=true; shift ;;
         -h|--help) usage ;;
@@ -144,6 +154,9 @@ START_TIME=$(date +%s)
 
 # Download model
 echo "Downloading model '$MODEL_NAME' using uvx..."
+if [ "$USE_CHINA_MIRROR" = "1" ]; then
+    echo "  HuggingFace endpoint: $HF_ENDPOINT (China mirror)"
+fi
 DOWNLOAD_START=$(date +%s)
 if uvx hf download "$MODEL_NAME"; then
     DOWNLOAD_END=$(date +%s)

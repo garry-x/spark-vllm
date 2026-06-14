@@ -412,6 +412,7 @@ def generate_launch_script(
     is_solo: bool = False,
     extra_args: list[str] | None = None,
     no_ray: bool = False,
+    use_china_mirrors: bool = True,
 ) -> str:
     """
     Generate a bash launch script from the recipe.
@@ -442,11 +443,17 @@ def generate_launch_script(
         - Allows passing any vLLM argument not covered by template variables
         - vLLM uses "last wins" semantics for duplicate arguments
 
+    CHINA MIRROR SUPPORT:
+        - When use_china_mirrors=True, automatically sets HF_ENDPOINT=hf-mirror.com
+          unless the recipe's env already defines HF_ENDPOINT
+        - This accelerates HuggingFace model downloads inside the container
+
     Args:
         recipe: Loaded recipe dictionary
         overrides: CLI-provided parameter overrides (take precedence over defaults)
         is_solo: If True, strip distributed executor configuration
         extra_args: Additional arguments to append to vLLM command (after --)
+        use_china_mirrors: If True, auto-configure HF_ENDPOINT for China
 
     Returns:
         Complete bash script content as string
@@ -462,6 +469,11 @@ def generate_launch_script(
 
     # Add environment variables
     env_vars = recipe.get("env", {})
+
+    # Auto-configure China mirrors for HuggingFace downloads
+    if use_china_mirrors:
+        env_vars.setdefault("HF_ENDPOINT", "https://hf-mirror.com")
+
     if env_vars:
         lines.append("# Environment variables")
         for key, value in env_vars.items():
@@ -852,6 +864,13 @@ Examples:
         help="Keep the Docker image entrypoint instead of clearing it before launch",
     )
     launch_group.add_argument(
+        "--no-china-mirror",
+        action="store_true",
+        dest="no_china_mirror",
+        help="Disable China mirror auto-configuration (HF_ENDPOINT=hf-mirror.com). "
+        "Use if you have direct access to HuggingFace or have set your own mirror.",
+    )
+    launch_group.add_argument(
         "--non-privileged",
         action="store_true",
         dest="non_privileged",
@@ -1087,6 +1106,9 @@ Examples:
             print(f"Container name: {args.container_name}")
         if args.non_privileged:
             print("Non-privileged mode: Yes")
+        china_mirrors = not getattr(args, "no_china_mirror", False)
+        if china_mirrors:
+            print("China mirror: HF_ENDPOINT=https://hf-mirror.com (use --no-china-mirror to disable)")
         print()
 
     # --- Build Phase ---
@@ -1221,6 +1243,9 @@ Examples:
                         f"         vLLM uses last value; extra args appear after template substitution"
                     )
 
+    # China mirror support
+    use_china_mirrors = not getattr(args, "no_china_mirror", False)
+
     # Generate launch script
     script_content = generate_launch_script(
         recipe,
@@ -1228,6 +1253,7 @@ Examples:
         is_solo=is_solo,
         extra_args=extra_args,
         no_ray=getattr(args, "no_ray", False),
+        use_china_mirrors=use_china_mirrors,
     )
 
     if args.dry_run:
