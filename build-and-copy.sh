@@ -23,7 +23,9 @@ TMP_IMAGE=""
 PARALLEL_COPY=false
 EXP_MXFP4=false
 VLLM_PRS=""
+APPLY_PRESET_VLLM_PRS=false
 FLASHINFER_PRS=""
+# Deprecated --tf5 aliases are kept for tag compatibility only; they no longer alter dependency resolution.
 PRE_TRANSFORMERS=false
 FULL_LOG=false
 BUILD_JOBS="16"
@@ -57,7 +59,7 @@ generate_build_metadata() {
     local vllm_commit="$3"
     local flashinfer_commit="$4"
     local vllm_ref="$5"
-    local pre_transformers="$6"
+    local transformers_5="$6"
     local exp_mxfp4="$7"
     local vllm_prs="$8"
 
@@ -74,7 +76,7 @@ gpu_arch: ${GPU_ARCH_LIST}
 base_image: ${base_image:-unknown}
 build_args:
   vllm_ref: ${vllm_ref}
-  transformers_5: ${pre_transformers}
+  transformers_5: ${transformers_5}
   exp_mxfp4: ${exp_mxfp4}
   vllm_prs: "${vllm_prs}"
   build_jobs: ${BUILD_JOBS}
@@ -397,9 +399,10 @@ usage() {
     echo "      --copy-parallel           : Copy to all hosts in parallel instead of serially."
     echo "  -j, --build-jobs <jobs>       : Number of concurrent build jobs (default: ${BUILD_JOBS})"
     echo "  -u, --user <user>             : Username for ssh command (default: \$USER)"
-    echo "  --tf5                         : Install transformers>=5 (aliases: --pre-tf, --pre-transformers)"
+    echo "  --tf5                         : Deprecated compatibility flag; normal build, tag defaults to 'vllm-node-tf5' (aliases: --pre-tf, --pre-transformers)"
     echo "  --exp-mxfp4, --experimental-mxfp4 : Build with experimental native MXFP4 support"
     echo "  --apply-vllm-pr <pr-num>      : Apply a specific PR patch to vLLM source. Can be specified multiple times."
+    echo "  --apply-preset-vllm-prs       : Also apply Dockerfile preset vLLM PRs when --apply-vllm-pr is specified."
     echo "  --apply-flashinfer-pr <pr-num>: Apply a specific PR patch to FlashInfer source. Can be specified multiple times."
     echo "  --full-log                    : Enable full build logging (--progress=plain)"
     echo "  --no-build                    : Skip building, only copy image (requires --copy-to)"
@@ -457,6 +460,7 @@ while [[ "$#" -gt 0 ]]; do
                exit 1
             fi
             ;;
+        --apply-preset-vllm-prs) APPLY_PRESET_VLLM_PRS=true ;;
         --apply-flashinfer-pr)
             if [ -n "$2" ] && [[ "$2" != -* ]]; then
                if [ -n "$FLASHINFER_PRS" ]; then
@@ -500,6 +504,11 @@ if [ "$IMAGE_TAG_SET" = false ]; then
     elif [ "$EXP_MXFP4" = true ]; then
         IMAGE_TAG="vllm-node-mxfp4"
     fi
+fi
+
+if [ "$PRE_TRANSFORMERS" = true ]; then
+    echo "Warning: --tf5/--pre-tf/--pre-transformers is deprecated; vLLM now uses Transformers v5 by default."
+    echo "         No Transformers override will be applied; image tag remains $IMAGE_TAG."
 fi
 
 # Source autodiscover.sh to load .env file
@@ -865,6 +874,13 @@ if [ "$NO_BUILD" = false ]; then
             if [ -n "$VLLM_PRS" ]; then
                 echo "Applying vLLM PRs: $VLLM_PRS"
                 VLLM_CMD+=("--build-arg" "VLLM_PRS=$VLLM_PRS")
+                if [ "$APPLY_PRESET_VLLM_PRS" = true ]; then
+                    echo "Also applying preset vLLM PRs from the Dockerfile."
+                    VLLM_CMD+=("--build-arg" "VLLM_APPLY_PRESET_PRS=1")
+                else
+                    echo "Skipping preset vLLM PRs because --apply-vllm-pr was specified."
+                    VLLM_CMD+=("--build-arg" "VLLM_APPLY_PRESET_PRS=0")
+                fi
             fi
 
             VLLM_CMD+=(".")
@@ -898,16 +914,11 @@ if [ "$NO_BUILD" = false ]; then
         FLASHINFER_COMMIT=""
         [ -f "./wheels/.flashinfer-commit" ] && FLASHINFER_COMMIT=$(cat ./wheels/.flashinfer-commit)
         generate_build_metadata Dockerfile "$VLLM_VERSION" "$VLLM_COMMIT" "$FLASHINFER_COMMIT" \
-            "$VLLM_REF" "$PRE_TRANSFORMERS" "false" "$VLLM_PRS"
+            "$VLLM_REF" "true" "false" "$VLLM_PRS"
 
         RUNNER_CMD=("docker" "build"
             "-t" "$IMAGE_TAG"
             "${COMMON_BUILD_FLAGS[@]}")
-
-        if [ "$PRE_TRANSFORMERS" = true ]; then
-            echo "Using transformers>=5.0.0..."
-            RUNNER_CMD+=("--build-arg" "PRE_TRANSFORMERS=1")
-        fi
 
         RUNNER_CMD+=(".")
 

@@ -336,6 +336,7 @@ ENV PATH=$VLLM_BASE_DIR:$PATH
 RUN --mount=type=cache,id=uv-cache,target=/root/.cache/uv \
     PINNED_TORCH=$(python3 -c "import torch; print(torch.__version__)") && \
     echo "torch==${PINNED_TORCH}" > /tmp/torch-override.txt && \
+    echo "fastapi[standard]>=0.115.0,<0.137.0" >> /tmp/torch-override.txt && \
     uv pip install ray[default] fastsafetensors "nvidia-nvshmem-cu13<3.6" \
         --override /tmp/torch-override.txt \
         --extra-index-url https://download.pytorch.org/whl/cu130 \
