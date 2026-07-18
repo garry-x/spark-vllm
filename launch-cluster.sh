@@ -25,6 +25,7 @@ NODES_ARG=""
 CONTAINER_NAME="$DEFAULT_CONTAINER_NAME"
 COMMAND_TO_RUN=""
 DAEMON_MODE="false"
+PERSIST="false"
 CHECK_CONFIG="false"
 ACTION=""
 CLUSTER_WAS_RUNNING="false"
@@ -76,6 +77,8 @@ usage() {
     echo "  --keep-entrypoint Keep the Docker image entrypoint instead of clearing it by default"
     echo "  --earlyoom      Run earlyoom as the container foreground process instead of sleep infinity"
     echo "  --earlyoom-args Arguments passed to earlyoom (default: '-M 524288,102400 -s 100 -r 60')"
+    echo "  --persist       Keep container after stop; launch script becomes CMD for docker start"
+    echo "                  (requires --name --launch-script, incompatible with --earlyoom)"
     echo "  -d              Daemon mode (only for 'start' action)"
     echo "  --non-privileged Run in non-privileged mode (removes --privileged and --ipc=host)"
     echo "  --mem-limit-gb  Memory limit in GB (default: 110, only with --non-privileged)"
@@ -168,6 +171,7 @@ while [[ "$#" -gt 0 ]]; do
         --pids-limit) PIDS_LIMIT="$2"; shift ;;
         --shm-size-gb) SHM_SIZE_GB="$2"; shift ;;
         -d) DAEMON_MODE="true" ;;
+        --persist) PERSIST="true" ;;
         -h|--help) usage ;;
         --config) CONFIG_FILE="$2"; shift ;;
         --setup|--discover) FORCE_DISCOVER=true; export FORCE_DISCOVER ;;
@@ -325,6 +329,21 @@ if [[ "$ENABLE_EARLYOOM" == "true" && "$KEEP_ENTRYPOINT" == "true" ]]; then
     echo "Error: --earlyoom requires launch-cluster.sh to clear the image entrypoint."
     echo "       Remove --keep-entrypoint so earlyoom can run as the foreground process."
     exit 1
+fi
+
+if [[ "$PERSIST" == "true" ]]; then
+    if [[ -z "$LAUNCH_SCRIPT_PATH" ]]; then
+        echo "Error: --persist requires --launch-script."
+        exit 1
+    fi
+    if [[ "$CONTAINER_NAME" == "$DEFAULT_CONTAINER_NAME" ]]; then
+        echo "Error: --persist requires --name (a unique container name)."
+        exit 1
+    fi
+    if [[ "$ENABLE_EARLYOOM" == "true" ]]; then
+        echo "Error: --persist is incompatible with --earlyoom."
+        exit 1
+    fi
 fi
 
 if ! [[ "$NOFILE_LIMIT" =~ ^[1-9][0-9]*$ ]]; then
@@ -664,8 +683,8 @@ if [[ "$ACTION" == "status" ]]; then
 fi
 
 # Trap signals
-# Only trap if we are NOT in daemon mode (container should persist in daemon mode)
-if [[ "$DAEMON_MODE" == "false" ]]; then
+# Only trap if we are NOT in daemon or persist mode (container should persist)
+if [[ "$DAEMON_MODE" == "false" && "$PERSIST" != "true" ]]; then
     trap cleanup EXIT INT TERM HUP
 fi
 
@@ -976,7 +995,12 @@ start_ray_worker() {
 }
 
 container_keepalive_command() {
-    if [[ "$ENABLE_EARLYOOM" == "true" ]]; then
+    if [[ "$PERSIST" == "true" ]]; then
+        # Wrapper: run the launch script if it exists, otherwise sleep.
+        # On first creation the script doesn't exist yet (copied in later),
+        # but on docker start restarts it will be present and run automatically.
+        printf "bash -c 'bash %s 2>/dev/null || sleep infinity'" "$CONTAINER_EXEC_SCRIPT"
+    elif [[ "$ENABLE_EARLYOOM" == "true" ]]; then
         printf 'earlyoom %s' "$EARLYOOM_ARGS"
     else
         printf 'sleep infinity'
@@ -1005,7 +1029,11 @@ start_cluster() {
         done
     fi
 
-    local docker_args_common="--gpus all -d --rm $docker_network_args --name $CONTAINER_NAME $docker_entrypoint_args $DOCKER_ARGS $IMAGE_NAME"
+    local docker_rm_flag="--rm"
+    if [[ "$PERSIST" == "true" ]]; then
+        docker_rm_flag=""
+    fi
+    local docker_args_common="--gpus all -d $docker_rm_flag $docker_network_args --name $CONTAINER_NAME $docker_entrypoint_args $DOCKER_ARGS $IMAGE_NAME"
     local docker_caps_args=""
     local docker_resource_args=""
 
@@ -1178,7 +1206,41 @@ if [[ "$ACTION" == "exec" && "$SOLO_MODE" == "false" && "$NO_RAY_MODE" == "false
     COMMAND_TO_RUN=$(ensure_ray_backend_command "$COMMAND_TO_RUN")
 fi
 
-if [[ "$ACTION" == "exec" ]]; then
+if [[ "$ACTION" == "exec" && "$PERSIST" == "true" ]]; then
+    # Persist mode: container CMD is the wrapper; command runs in background.
+
+    # Handle existing container with same name (stopped from previous persist run)
+    if docker container inspect "$CONTAINER_NAME" &>/dev/null; then
+        if docker ps --format '{{.Names}}' | grep -q "^${CONTAINER_NAME}$"; then
+            echo "Error: Container '$CONTAINER_NAME' is already running."
+            echo "  Stop it first:  docker stop $CONTAINER_NAME"
+            echo "  Or re-create:   docker rm -f $CONTAINER_NAME && re-run this command"
+            exit 1
+        else
+            echo "Removing existing stopped container '$CONTAINER_NAME'..."
+            docker rm "$CONTAINER_NAME" >/dev/null
+        fi
+    fi
+
+    start_cluster
+    echo "Persistent container '$CONTAINER_NAME' created."
+    echo "Executing launch script in background..."
+    docker exec -d "$CONTAINER_NAME" bash -c "$COMMAND_TO_RUN >> /proc/1/fd/1 2>&1"
+    echo "Container will persist after stop. Manage with:"
+    echo "  docker stop $CONTAINER_NAME"
+    echo "  docker start $CONTAINER_NAME  (vLLM auto-restarts)"
+    echo "  docker logs -f $CONTAINER_NAME"
+    echo "  docker rm -f $CONTAINER_NAME   (permanently delete)"
+    if [[ "$DAEMON_MODE" != "true" ]]; then
+        echo ""
+        echo "Tailing container logs (Ctrl+C to detach)..."
+        docker logs -f "$CONTAINER_NAME" &
+        wait $!
+        echo ""
+        echo "Detached. Container still running: $CONTAINER_NAME"
+    fi
+    exit 0
+elif [[ "$ACTION" == "exec" ]]; then
     # Trim (or error on) PEER_NODES based on declared parallelism, for any multi-node exec
     if [[ "$SOLO_MODE" != "true" && ${#PEER_NODES[@]} -gt 0 ]]; then
         if [[ "$LAUNCH_SCRIPT_MODE" == "true" ]]; then

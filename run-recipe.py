@@ -893,6 +893,14 @@ Examples:
         help="Keep the Docker image entrypoint instead of clearing it before launch",
     )
     launch_group.add_argument(
+        "--persist",
+        action="store_true",
+        dest="persist",
+        help="Create a persistent container (no --rm). Requires --name. "
+        "Container survives docker stop and can be restarted with docker start. "
+        "vLLM auto-starts on docker start.",
+    )
+    launch_group.add_argument(
         "--no-china-mirror",
         action="store_true",
         dest="no_china_mirror",
@@ -1116,6 +1124,15 @@ Examples:
     if (args.earlyoom or args.earlyoom_args) and args.keep_entrypoint:
         print("Error: --earlyoom requires launch-cluster.sh to clear the image entrypoint.")
         print("Remove --keep-entrypoint so earlyoom can run as the foreground process.")
+        return 1
+
+    if args.persist and not args.container_name:
+        print("Error: --persist requires --name to ensure the container can be restarted by name.")
+        print("Example: --name my-serve --persist")
+        return 1
+
+    if args.persist and args.earlyoom:
+        print("Error: --persist is incompatible with --earlyoom.")
         return 1
 
     # Determine copy targets for build/model distribution.
@@ -1358,6 +1375,8 @@ Examples:
             cmd_parts.append("--no-cache-dirs")
         if args.keep_entrypoint:
             cmd_parts.append("--keep-entrypoint")
+        if args.persist:
+            cmd_parts.append("--persist")
         if args.earlyoom:
             cmd_parts.append("--earlyoom")
         if args.earlyoom_args:
@@ -1447,6 +1466,8 @@ Examples:
             cmd.append("--no-cache-dirs")
         if args.keep_entrypoint:
             cmd.append("--keep-entrypoint")
+        if args.persist:
+            cmd.append("--persist")
         if args.earlyoom:
             cmd.append("--earlyoom")
         if args.earlyoom_args:
