@@ -1021,10 +1021,12 @@ start_cluster() {
     fi
 
     local docker_rm_flag="--rm"
+    local docker_restart_flag=""
     if [[ "$PERSIST" == "true" ]]; then
         docker_rm_flag=""
+        docker_restart_flag="--restart=unless-stopped"
     fi
-    local docker_args_common="--gpus all -d $docker_rm_flag $docker_network_args --name $CONTAINER_NAME $docker_entrypoint_args $DOCKER_ARGS $IMAGE_NAME"
+    local docker_args_common="--gpus all -d $docker_rm_flag $docker_restart_flag $docker_network_args --name $CONTAINER_NAME $docker_entrypoint_args $DOCKER_ARGS $IMAGE_NAME"
     local docker_caps_args=""
     local docker_resource_args=""
 
