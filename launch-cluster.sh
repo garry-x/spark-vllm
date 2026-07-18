@@ -1232,19 +1232,11 @@ if [[ "$ACTION" == "exec" && "$PERSIST" == "true" ]]; then
     echo "Persistent container '$CONTAINER_NAME' created."
     echo "Executing launch script in background..."
     docker exec -d "$CONTAINER_NAME" bash -c "$COMMAND_TO_RUN >> /proc/1/fd/1 2>&1"
-    echo "Container will persist after stop. Manage with:"
-    echo "  docker stop $CONTAINER_NAME"
-    echo "  docker start $CONTAINER_NAME  (vLLM auto-restarts)"
+    echo "vLLM starting in background. Manage with:"
     echo "  docker logs -f $CONTAINER_NAME"
+    echo "  docker stop $CONTAINER_NAME"
+    echo "  docker start $CONTAINER_NAME   (vLLM auto-restarts)"
     echo "  docker rm -f $CONTAINER_NAME   (permanently delete)"
-    if [[ "$DAEMON_MODE" != "true" ]]; then
-        echo ""
-        echo "Tailing container logs (Ctrl+C to detach)..."
-        docker logs -f "$CONTAINER_NAME" &
-        wait $!
-        echo ""
-        echo "Detached. Container still running: $CONTAINER_NAME"
-    fi
     exit 0
 elif [[ "$ACTION" == "exec" ]]; then
     # Trim (or error on) PEER_NODES based on declared parallelism, for any multi-node exec
