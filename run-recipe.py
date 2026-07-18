@@ -1127,9 +1127,12 @@ Examples:
         return 1
 
     if args.persist and not args.container_name:
-        print("Error: --persist requires --name to ensure the container can be restarted by name.")
-        print("Example: --name my-serve --persist")
-        return 1
+        # Auto-generate container name from recipe name
+        import re
+        container_name = re.sub(r'[^a-zA-Z0-9_.-]', '-', recipe['name'].lower())
+        container_name = container_name.strip('-')
+        args.container_name = container_name
+        print(f"Auto-generated container name: {args.container_name}")
 
     if args.persist and args.earlyoom:
         print("Error: --persist is incompatible with --earlyoom.")

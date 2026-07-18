@@ -336,10 +336,6 @@ if [[ "$PERSIST" == "true" ]]; then
         echo "Error: --persist requires --launch-script."
         exit 1
     fi
-    if [[ "$CONTAINER_NAME" == "$DEFAULT_CONTAINER_NAME" ]]; then
-        echo "Error: --persist requires --name (a unique container name)."
-        exit 1
-    fi
     if [[ "$ENABLE_EARLYOOM" == "true" ]]; then
         echo "Error: --persist is incompatible with --earlyoom."
         exit 1
