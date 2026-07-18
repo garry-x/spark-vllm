@@ -991,12 +991,7 @@ start_ray_worker() {
 }
 
 container_keepalive_command() {
-    if [[ "$PERSIST" == "true" ]]; then
-        # Wrapper: run the launch script if it exists, otherwise sleep.
-        # On first creation the script doesn't exist yet (copied in later),
-        # but on docker start restarts it will be present and run automatically.
-        printf "bash -c 'bash %s 2>/dev/null || sleep infinity'" "$CONTAINER_EXEC_SCRIPT"
-    elif [[ "$ENABLE_EARLYOOM" == "true" ]]; then
+    if [[ "$ENABLE_EARLYOOM" == "true" ]]; then
         printf 'earlyoom %s' "$EARLYOOM_ARGS"
     else
         printf 'sleep infinity'
@@ -1051,8 +1046,17 @@ start_cluster() {
             mkdir -p "$dir"
         done
     fi
-    docker run $docker_caps_args $docker_resource_args \
-        $(get_env_flags "$HEAD_IP") $docker_args_common $keepalive_cmd
+    if [[ "$PERSIST" == "true" ]]; then
+        # Persist wrapper: run launch script if it exists, otherwise keep alive with sleep.
+        # Inline quotes are parsed by bash at script parse time (not via variable),
+        # so -c gets the full command string as a single argument.
+        docker run $docker_caps_args $docker_resource_args \
+            $(get_env_flags "$HEAD_IP") $docker_args_common \
+            bash -c "bash $CONTAINER_EXEC_SCRIPT 2>/dev/null || sleep infinity"
+    else
+        docker run $docker_caps_args $docker_resource_args \
+            $(get_env_flags "$HEAD_IP") $docker_args_common $keepalive_cmd
+    fi
 
     # Start Worker Nodes
     for worker in "${PEER_NODES[@]}"; do
@@ -1061,7 +1065,11 @@ start_cluster() {
             ssh "$worker" "mkdir -p ${CACHE_DIRS_TO_CREATE[*]}"
         fi
         local docker_run_cmd="docker run $docker_caps_args $docker_resource_args $(get_env_flags "$worker") $docker_args_common"
-        ssh "$worker" "$docker_run_cmd $keepalive_cmd"
+        if [[ "$PERSIST" == "true" ]]; then
+            ssh "$worker" "$docker_run_cmd bash -c \"bash $CONTAINER_EXEC_SCRIPT 2>/dev/null || sleep infinity\""
+        else
+            ssh "$worker" "$docker_run_cmd $keepalive_cmd"
+        fi
     done
 
     # Apply mods (containers are idle — no mod_done sync needed)
