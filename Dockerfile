@@ -155,6 +155,7 @@ RUN --mount=type=cache,id=repo-cache,target=/repo-cache \
         git fetch origin && \
         git fetch origin --tags --force && \
         (git checkout --detach origin/${FLASHINFER_REF} 2>/dev/null || git checkout ${FLASHINFER_REF}) && \
+        git reset --hard HEAD && \
         git submodule update --init --recursive && \
         git clean -fdx && \
         git gc --auto; \
@@ -165,31 +166,112 @@ WORKDIR /workspace/flashinfer
 
 ARG FLASHINFER_PRS=""
 
+# PR refs include the branch history they were developed on. Use upstream main
+# only to identify each PR's patch range, then apply that patch to FLASHINFER_REF.
 RUN set -eux; \
+    FLASHINFER_REQUESTED_HEAD="$(git rev-parse HEAD)"; \
     if [ -n "$FLASHINFER_PRS" ]; then \
-        # Git requires a user identity to create merge commits
+        # cp -a preserves the source repository's index stat data, but the copied
+        # files have different filesystem identities. Refresh before --index apply.
+        git update-index --refresh; \
         git config --global user.email "builder@example.com"; \
         git config --global user.name "Docker Builder"; \
         \
-        echo "Applying PRs: $FLASHINFER_PRS"; \
+        echo "Applying PR patches to FlashInfer ref $FLASHINFER_REF ($FLASHINFER_REQUESTED_HEAD): $FLASHINFER_PRS"; \
+        echo "Fetching origin/main only to calculate PR patch ranges; current checkout remains $FLASHINFER_REF."; \
+        git fetch origin +refs/heads/main:refs/remotes/origin/main; \
         for pr in $FLASHINFER_PRS; do \
-            echo "Fetching and merging PR #$pr..."; \
+            echo "Fetching PR #$pr and applying its patch onto current HEAD..."; \
             git fetch origin +pull/${pr}/head:pr-${pr}; \
-            if git merge-base --is-ancestor pr-${pr} HEAD; then \
-                echo "PR #$pr is already contained in HEAD; skipping."; \
-            else \
-                cherry_file="/tmp/pr-${pr}.cherry"; \
-                git cherry HEAD pr-${pr} > "$cherry_file"; \
-                if ! grep -q '^+' "$cherry_file"; then \
-                    echo "PR #$pr is already patch-equivalent to HEAD; skipping."; \
-                    rm -f "$cherry_file"; \
-                    continue; \
+            pr_base="$(git merge-base origin/main pr-${pr} || true)"; \
+            if [ -z "$pr_base" ]; then \
+                echo "Unable to find an origin/main merge-base for FlashInfer PR #$pr."; \
+                exit 1; \
+            fi; \
+            patch_file="/tmp/flashinfer-pr-${pr}.patch"; \
+            echo "FlashInfer PR #$pr patch range: $pr_base..pr-${pr}; apply target: $(git rev-parse HEAD)."; \
+            git diff --binary "$pr_base" "pr-${pr}" > "$patch_file"; \
+            if [ ! -s "$patch_file" ]; then \
+                echo "FlashInfer PR #$pr has no patch relative to origin/main; skipping."; \
+                rm -f "$patch_file"; \
+                continue; \
+            fi; \
+            if git apply --reverse --check --binary "$patch_file" >/dev/null 2>&1; then \
+                echo "FlashInfer PR #$pr patch is already applied to HEAD; skipping."; \
+                rm -f "$patch_file"; \
+                continue; \
+            fi; \
+            if git apply --3way --index --binary "$patch_file"; then \
+                if git diff --cached --quiet; then \
+                    echo "FlashInfer PR #$pr patch produced no staged changes; skipping."; \
+                else \
+                    git commit -m "Apply FlashInfer PR #${pr}"; \
                 fi; \
-                rm -f "$cherry_file"; \
-                git merge pr-${pr} --no-edit; \
+                rm -f "$patch_file"; \
+            else \
+                conflict_files="$(git diff --name-only --diff-filter=U)"; \
+                if [ -n "$conflict_files" ]; then \
+                    echo "FlashInfer PR #$pr has patch conflicts: $conflict_files"; \
+                else \
+                    echo "FlashInfer PR #$pr patch failed without unmerged files."; \
+                fi; \
+                rm -f "$patch_file"; \
+                git reset --hard HEAD; \
+                exit 1; \
             fi; \
         done; \
+        if ! git merge-base --is-ancestor "$FLASHINFER_REQUESTED_HEAD" HEAD; then \
+            echo "Requested FlashInfer ref $FLASHINFER_REF ($FLASHINFER_REQUESTED_HEAD) is not an ancestor of final HEAD $(git rev-parse HEAD) after PR application."; \
+            exit 1; \
+        fi; \
+        echo "Final FlashInfer source after PR application: requested $FLASHINFER_REF ($FLASHINFER_REQUESTED_HEAD), final $(git describe --tags --always --dirty)."; \
     fi
+
+# TEMPORARY PATCH: FlashInfer PR #3738 narrowed native FP4 profiler workspace
+# allocation to the FP8-activation family. Native SM100+ NVFP4 MoE uses FP4
+# activations and FP4 weights, so autotune allocates null quant workspaces and
+# fails in prepareQuantParams(). Remove after the upstream FlashInfer fix lands.
+RUN python3 - <<'PY'
+from pathlib import Path
+
+target = Path("csrc/fused_moe/cutlass_backend/cutlass_fused_moe_kernels.cuh")
+old_predicate = (
+    "  bool const is_native_wfp4afp8_family = isNativeWfp4Afp8Family();\n"
+)
+fixed_predicates = """  bool const is_native_wfp4afp8_family = isNativeWfp4Afp8Family();
+  // Native Blackwell NVFP4 uses FP4 activations and FP4 weights.
+  bool const is_native_wfp4afp4_family =
+      mSM >= 100 &&
+      (mDType == nvinfer1::DataType::kFP4 || mDType == nvinfer1::DataType::kINT64) &&
+      (mWType == nvinfer1::DataType::kFP4 || mWType == nvinfer1::DataType::kINT64);
+"""
+old_branch = "  if (is_native_wfp4afp8_family) {"
+fixed_branch = (
+    "  if (is_native_wfp4afp8_family || is_native_wfp4afp4_family) {"
+)
+
+if not target.exists():
+    raise SystemExit(f"{target} not found; cannot apply NVFP4 profiler patch")
+
+text = target.read_text()
+already_fixed = fixed_predicates in text and fixed_branch in text
+if already_fixed:
+    print("FlashInfer native NVFP4 profiler workaround already present; skipping")
+else:
+    if text.count(old_predicate) != 1 or text.count(old_branch) != 1:
+        raise SystemExit(
+            "Known FlashInfer PR #3738 profiler pattern not found exactly once; "
+            "refusing to apply an unverified patch"
+        )
+    text = text.replace(old_predicate, fixed_predicates, 1)
+    text = text.replace(old_branch, fixed_branch, 1)
+    target.write_text(text)
+    print("Applied FlashInfer native NVFP4 profiler workspace workaround")
+
+patched = target.read_text()
+if fixed_predicates not in patched or fixed_branch not in patched:
+    raise SystemExit("FlashInfer native NVFP4 profiler patch verification failed")
+PY
 
 # TEMPORARY patch for flashinfer autotune and other improvements (PR 2927) - MERGED 4/3
 # RUN curl -fsL https://github.com/flashinfer-ai/flashinfer/pull/2927.diff -o pr2927.diff \
@@ -275,6 +357,7 @@ RUN --mount=type=cache,id=repo-cache,target=/repo-cache \
         git fetch origin && \
         git fetch origin --tags --force && \
         (git checkout --detach origin/${VLLM_REF} 2>/dev/null || git checkout ${VLLM_REF}) && \
+        git reset --hard HEAD && \
         git submodule update --init --recursive && \
         git clean -fdx && \
         git gc --auto; \
@@ -337,6 +420,9 @@ RUN set -eux; \
         esac; \
     done; \
     if [ -n "$VLLM_ALL_PRS" ]; then \
+        # cp -a preserves the source repository's index stat data, but the copied
+        # files have different filesystem identities. Refresh before --index apply.
+        git update-index --refresh; \
         git config --global user.email "builder@example.com"; \
         git config --global user.name "Docker Builder"; \
         \

@@ -305,6 +305,23 @@ test_build_only_flags_warn_on_prebuilt() {
     pass "build-only flags warn but do not force wheel path"
 }
 
+test_flashinfer_ref_forwards_selected_ref() {
+    setup_fixture
+    run_build --flashinfer-ref 0123456789abcdef || fail "--flashinfer-ref run failed"
+    assert_log_contains '^docker build --target flashinfer-export .*--build-arg FLASHINFER_REF=0123456789abcdef'
+    assert_output_contains 'Rebuilding FlashInfer wheels \(--flashinfer-ref specified\)\.\.\.'
+    pass "--flashinfer-ref forwards selected ref"
+}
+
+test_requested_flashinfer_prs_apply_to_selected_ref() {
+    setup_fixture
+    run_build --flashinfer-ref 0123456789abcdef --apply-flashinfer-pr 12345 || fail "--apply-flashinfer-pr with --flashinfer-ref run failed"
+    assert_log_contains '^docker build --target flashinfer-export .*--build-arg FLASHINFER_REF=0123456789abcdef .*--build-arg FLASHINFER_PRS=12345'
+    assert_output_contains 'Rebuilding FlashInfer wheels \(--flashinfer-ref and --apply-flashinfer-pr specified\)\.\.\.'
+    assert_output_contains 'Applying FlashInfer PRs: 12345'
+    pass "--apply-flashinfer-pr applies requested PRs to selected ref"
+}
+
 test_vllm_ref_skips_preset_prs_by_default() {
     setup_fixture
     run_build --vllm-ref ab666069935c1f23e8ef56038b4659ac9e8f19f8 || fail "--vllm-ref run failed"
@@ -364,6 +381,75 @@ test_requested_vllm_prs_apply_to_selected_vllm_ref() {
     pass "--apply-vllm-pr applies requested PRs to selected ref"
 }
 
+test_copied_vllm_git_index_is_refreshed_before_patch_apply() {
+    local source_repo="$TMP_BASE/git-index-source"
+    local copied_repo="$TMP_BASE/git-index-copy"
+    local patch_file="$TMP_BASE/git-index.patch"
+    local apply_error="$TMP_BASE/git-index-apply-error.log"
+    local base_commit patched_commit
+
+    mkdir -p "$source_repo"
+    git -C "$source_repo" init -q
+    git -C "$source_repo" config user.email "test@example.com"
+    git -C "$source_repo" config user.name "Test Builder"
+
+    printf 'base\n' > "$source_repo/tracked.txt"
+    git -C "$source_repo" add tracked.txt
+    git -C "$source_repo" commit -qm "base"
+    base_commit="$(git -C "$source_repo" rev-parse HEAD)"
+
+    printf 'patched\n' > "$source_repo/tracked.txt"
+    git -C "$source_repo" commit -qam "patch"
+    patched_commit="$(git -C "$source_repo" rev-parse HEAD)"
+    git -C "$source_repo" diff --binary "$base_commit" "$patched_commit" > "$patch_file"
+    git -C "$source_repo" checkout -q --detach "$base_commit"
+
+    cp -a "$source_repo" "$copied_repo"
+    if git -C "$copied_repo" apply --3way --index --binary "$patch_file" 2> "$apply_error"; then
+        fail "copied repository unexpectedly accepted --index apply without refreshing"
+    fi
+    if ! grep -q 'does not match index' "$apply_error"; then
+        fail "copied repository did not reproduce the stale-index failure"
+    fi
+
+    git -C "$copied_repo" update-index --refresh
+    git -C "$copied_repo" apply --3way --index --binary "$patch_file"
+    if [ "$(git -C "$copied_repo" show :tracked.txt)" != "patched" ]; then
+        fail "patch did not apply after refreshing the copied repository index"
+    fi
+
+    if ! grep -q 'git reset --hard HEAD' "$PROJECT_DIR/Dockerfile"; then
+        fail "Dockerfile does not clean the cached vLLM checkout"
+    fi
+    if ! grep -q 'git update-index --refresh' "$PROJECT_DIR/Dockerfile"; then
+        fail "Dockerfile does not refresh the copied vLLM index"
+    fi
+    pass "copied vLLM Git index is refreshed before patch apply"
+}
+
+test_dockerfile_applies_flashinfer_prs_without_merging_branch_history() {
+    local flashinfer_pr_block="$TMP_BASE/flashinfer-pr-block"
+
+    sed -n '/ARG FLASHINFER_PRS=""/,/# TEMPORARY patch/p' "$PROJECT_DIR/Dockerfile" > "$flashinfer_pr_block"
+    for expected in \
+        'git update-index --refresh' \
+        'git merge-base origin/main pr-${pr}' \
+        'git diff --binary "$pr_base" "pr-${pr}"' \
+        'git apply --3way --index --binary "$patch_file"' \
+        'git merge-base --is-ancestor "$FLASHINFER_REQUESTED_HEAD" HEAD'; do
+        if ! grep -Fq "$expected" "$flashinfer_pr_block"; then
+            fail "FlashInfer PR block is missing patch-only behavior: $expected"
+        fi
+    done
+    if grep -Fq 'git merge pr-${pr}' "$flashinfer_pr_block"; then
+        fail "FlashInfer PR block still merges complete PR branch history"
+    fi
+    if ! sed -n '/if \[ ! -d "flashinfer" \]/,/cp -a \/repo-cache\/flashinfer/p' "$PROJECT_DIR/Dockerfile" | grep -Fq 'git reset --hard HEAD'; then
+        fail "Dockerfile does not clean the cached FlashInfer checkout"
+    fi
+    pass "FlashInfer PRs apply as patches without merging branch history"
+}
+
 test_default_uses_prebuilt
 test_tf5_uses_prebuilt_tf5_tag
 test_custom_tag_uses_prebuilt_custom_tag
@@ -380,6 +466,8 @@ test_copy_skips_matching_remote_image
 test_copy_only_updates_missing_or_different_hosts
 test_no_build_skips_prebuilt
 test_build_only_flags_warn_on_prebuilt
+test_flashinfer_ref_forwards_selected_ref
+test_requested_flashinfer_prs_apply_to_selected_ref
 test_rebuild_vllm_applies_preset_prs_by_default
 test_vllm_ref_skips_preset_prs_by_default
 test_apply_vllm_pr_skips_preset_prs_by_default
@@ -387,5 +475,7 @@ test_apply_vllm_pr_can_apply_preset_prs_explicitly
 test_vllm_ref_can_apply_preset_prs_explicitly
 test_apply_preset_prs_forces_vllm_rebuild
 test_requested_vllm_prs_apply_to_selected_vllm_ref
+test_copied_vllm_git_index_is_refreshed_before_patch_apply
+test_dockerfile_applies_flashinfer_prs_without_merging_branch_history
 
 echo "Passed $TESTS_PASSED build-and-copy tests."
