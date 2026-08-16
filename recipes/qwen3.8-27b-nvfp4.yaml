@@ -1,15 +1,14 @@
-# Recipe: Qwen3.8-27B-FP8
-# Qwen3.8-27B official block-scaled FP8 variant (28.7 GB weights).
-# Dense 27B hybrid-attention model (48 Gated DeltaNet + 16 full-attention layers),
-# 262K native context, built-in MTP speculative-decoding draft head.
-# Requires a vllm-node image built from recent vLLM main (>= 0.27.x nightly).
+# Recipe: Qwen3.8-27B-NVFP4
+# Qwen3.8-27B in NVFP4 (W4A4) quantization for Blackwell — halves weight
+# memory traffic vs FP8, ~2x decode speed on DGX Spark (bandwidth-bound).
+# No MTP: measured slower on GB10 (draft head competes for memory bandwidth).
 
 recipe_version: "1"
-name: Qwen3.8-27B-FP8
-description: vLLM serving Qwen/Qwen3.8-27B-FP8
+name: Qwen3.8-27B-NVFP4
+description: vLLM serving Inferact/Qwen3.8-27B-NVFP4
 
 # HuggingFace model to download (optional, for --download-model)
-model: Qwen/Qwen3.8-27B-FP8
+model: Inferact/Qwen3.8-27B-NVFP4
 
 # Fits comfortably on a single DGX Spark (128 GB unified memory)
 solo_only: true
@@ -27,7 +26,7 @@ defaults:
 
 # The vLLM serve command template
 command: |
-  vllm serve Qwen/Qwen3.8-27B-FP8 \
+  vllm serve Inferact/Qwen3.8-27B-NVFP4 \
     --host {host} \
     --port {port} \
     --max-model-len {max_model_len} \
@@ -38,4 +37,4 @@ command: |
     --enable-prefix-caching \
     --reasoning-parser qwen3 \
     --enable-auto-tool-choice \
-    --tool-call-parser qwen3_coder \
+    --tool-call-parser qwen3_coder
