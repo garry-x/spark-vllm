@@ -119,6 +119,9 @@ ARG CUTLASS_SHA=fede53000a962b46e05bafe0c86311778caeb380
 # --- CACHE BUSTER ---
 ARG CACHEBUST_FLASHINFER=1
 
+RUN --mount=type=cache,id=uv-cache,target=/root/.cache/uv \
+     uv pip install "nvidia-nvshmem-cu13<3.6" "apache-tvm-ffi==0.1.12"
+
 # Clone FlashInfer (cached for faster rebuilds)
 ARG GITHUB_PROXY
 RUN --mount=type=cache,id=git-flashinfer,target=/git-cache/flashinfer \

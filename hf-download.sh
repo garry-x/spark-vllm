@@ -20,9 +20,9 @@ fi
 usage() {
     echo "Usage: $0 [OPTIONS] <model-name>"
     echo "  <model-name>                : HuggingFace model name (e.g., 'QuantTrio/MiniMax-M2-AWQ')"
-    echo "  -c, --copy-to <hosts>       : Host(s) to copy the model to. Accepts comma or space-delimited lists after the flag."
+    echo "  -c, --copy-to [hosts]       : Copy the model. Omit hosts to use COPY_HOSTS from .env or autodiscovery."
     echo "      --copy-to-host          : Alias for --copy-to (backwards compatibility)."
-    echo "      --copy-parallel         : Copy to all hosts in parallel instead of serially."
+    echo "      --copy-parallel         : With -c, copy to all resolved hosts concurrently."
     echo "  --no-china-mirror           : Disable HuggingFace China mirror (hf-mirror.com)"
     echo "  --hf-endpoint <url>         : Custom HuggingFace endpoint (default: https://hf-mirror.com in China)"
     echo "  -u, --user <user>           : Username for ssh commands (default: \$USER)"
