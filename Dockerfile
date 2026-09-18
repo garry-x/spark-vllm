@@ -11,6 +11,11 @@ ARG CUTLASS_DSL_VERSION=4.7.0
 ARG B12X_REPO=""
 ARG B12X_REF=""
 ARG B12X_CACHEBUST=""
+ARG B12X_FROM_PYPI=0
+
+# Empty fallback for ordinary remote-source builds. A caller may override this
+# stage with --build-context vllm_source=/path/to/checkout.
+FROM scratch AS vllm_source
 
 # China mirror support — set to 1 to use Chinese mirrors for apt/pip/git/hf
 ARG USE_CHINA_MIRRORS=1
@@ -150,6 +155,8 @@ FROM base AS flashinfer-builder
 
 ARG FLASHINFER_CUDA_ARCH_LIST="12.1a"
 ENV FLASHINFER_CUDA_ARCH_LIST=${FLASHINFER_CUDA_ARCH_LIST}
+# The provider shim accepts the same space-separated dotted architectures.
+ENV FLASHINFER_JIT_CACHE_PROVIDER_ARCHS=${FLASHINFER_CUDA_ARCH_LIST}
 WORKDIR $VLLM_BASE_DIR
 ARG FLASHINFER_REF=main
 ARG FLASHINFER_BUILD_PYTHON=/usr/bin/python3
@@ -259,12 +266,11 @@ RUN set -eux; \
 
 
 
-# Apply patch to avoid re-downloading existing cubins
-COPY flashinfer_cache.patch .
+# FlashInfer #5240 reuses checksum-verified cubins from the cache mount below.
+COPY docker/build_flashinfer_jit_providers.sh /tmp/build_flashinfer_jit_providers.sh
 RUN --mount=type=cache,id=uv-cache,target=/root/.cache/uv \
     --mount=type=cache,id=ccache,target=/root/.ccache \
     --mount=type=cache,id=cubins-cache,target=/workspace/flashinfer/flashinfer-cubin/flashinfer_cubin/cubins \
-    patch -p1 < flashinfer_cache.patch && \
     # flashinfer-python
     sed -i -e 's/license = "Apache-2.0"/license = { text = "Apache-2.0" }/' -e '/license-files/d' pyproject.toml && \
     "$FLASHINFER_BUILD_PYTHON" -c 'import filelock, packaging, requests, torch, tqdm' && \
@@ -272,7 +278,8 @@ RUN --mount=type=cache,id=uv-cache,target=/root/.cache/uv \
     # flashinfer-cubin
     cd flashinfer-cubin && uv build --python "$FLASHINFER_BUILD_PYTHON" --no-build-isolation --wheel . --out-dir=/workspace/wheels -v && \
     # flashinfer-jit-cache
-    cd ../flashinfer-jit-cache && \
+    cd .. && bash /tmp/build_flashinfer_jit_providers.sh "$FLASHINFER_BUILD_PYTHON" /workspace/wheels && \
+    cd flashinfer-jit-cache && \
     uv build --python "$FLASHINFER_BUILD_PYTHON" --no-build-isolation --wheel . --out-dir=/workspace/wheels -v && \
     # dump git ref and target architecture in the wheels dir
     cd .. && \
@@ -315,6 +322,8 @@ ARG CACHEBUST_VLLM=1
 ARG VLLM_UPSTREAM_REPO=https://github.com/vllm-project/vllm.git
 ARG VLLM_REPO=https://github.com/vllm-project/vllm.git
 ARG VLLM_REF=main
+ARG VLLM_SOURCE_MODE=remote
+ARG VLLM_SOURCE_COMMIT=""
 
 # Pinned while investigating an SM121 DeepSeek-V4 MXFP4 grouped scale-factor
 # regression first observed at nv_dev f8e8fb5 (PR #384); last known good.
@@ -327,9 +336,31 @@ ENV DEEPGEMM_SRC_DIR=/workspace/DeepGEMM
 # GITHUB_PROXY (China mirror) applies via the global git url insteadOf config
 # set in the base stage, so no URL prefix is needed here.
 RUN --mount=type=cache,id=repo-cache,target=/repo-cache \
+    --mount=type=bind,from=vllm_source,target=/tmp/vllm-local-source \
     set -eux; \
     echo "CACHEBUST_VLLM=${CACHEBUST_VLLM}"; \
-    if [ "$VLLM_REPO" != "$VLLM_UPSTREAM_REPO" ]; then \
+    if [ "$VLLM_SOURCE_MODE" = "local" ]; then \
+        echo "Local vLLM source selected; using the staged build context."; \
+        if [ -z "$VLLM_SOURCE_COMMIT" ]; then \
+            echo "VLLM_SOURCE_COMMIT is required for a local vLLM source build." >&2; \
+            exit 1; \
+        fi; \
+        if [ ! -d /tmp/vllm-local-source/.git ]; then \
+            echo "Local vLLM source context does not contain a self-contained Git checkout." >&2; \
+            exit 1; \
+        fi; \
+        cp -a /tmp/vllm-local-source /tmp/vllm-custom; \
+        cd /tmp/vllm-custom; \
+        if [ "$(git rev-parse HEAD)" != "$VLLM_SOURCE_COMMIT" ]; then \
+            echo "Local vLLM source commit does not match VLLM_SOURCE_COMMIT." >&2; \
+            exit 1; \
+        fi; \
+        git reset --hard "$VLLM_SOURCE_COMMIT"; \
+        git clean -fdx; \
+        git remote remove origin 2>/dev/null || true; \
+        rm -f .git/FETCH_HEAD; \
+        cp -a /tmp/vllm-custom "$VLLM_BASE_DIR/vllm"; \
+    elif [ "$VLLM_REPO" != "$VLLM_UPSTREAM_REPO" ]; then \
         echo "Custom vLLM repository selected; bypassing shared checkout cache."; \
         git clone --recursive "$VLLM_REPO" /tmp/vllm-custom; \
         cd /tmp/vllm-custom; \
@@ -388,17 +419,21 @@ RUN --mount=type=cache,id=repo-cache,target=/repo-cache \
 
 WORKDIR $VLLM_BASE_DIR/vllm
 
-# Optional upstream PR patches requested by the build wrapper. PR #47392 is
-# carried as a source-aware runtime patch below because its full diff now
-# conflicts with current upstream main.
-ARG VLLM_PRESET_PRS=""
+# Optional upstream PR patches requested by the build wrapper. PR #54788 makes
+# Model Runner V2 honor an MTP/EAGLE draft's explicit MoE backend instead of
+# inheriting the quantized target's incompatible backend. Remove it once the fix
+# is present in the oldest vLLM ref used by regular builds. PR #47392 is carried
+# as a source-aware runtime patch below because its full diff now conflicts with
+# current upstream main.
+ARG VLLM_PRESET_PRS="54788"
 ARG VLLM_APPLY_PRESET_PRS=""
 ARG VLLM_PRS=""
 ARG VLLM_PRESERVE_SM12X_TARGET=0
 ARG VLLM_PATCH_B12X_C128A_ALIGNMENT=0
 
-# PR refs include the branch history they were developed on. Use upstream main
-# only to identify each PR's patch range, then apply that patch to VLLM_REF.
+# Numeric PR refs are resolved from vllm-project/vllm. Full GitHub PR URLs are
+# downloaded from the named repository, preserving that PR's own base range.
+# In both cases, apply only the resulting patch to VLLM_REF.
 RUN set -eux; \
     VLLM_ALL_PRS=""; \
     VLLM_SELECTED_PRESET_PRS=""; \
@@ -430,36 +465,56 @@ RUN set -eux; \
         git config --global user.name "Docker Builder"; \
         \
         echo "Applying PR patches to vLLM ref $VLLM_REF ($VLLM_REQUESTED_HEAD): $VLLM_ALL_PRS"; \
-        echo "Fetching upstream main only to calculate PR patch ranges; current checkout remains $VLLM_REF."; \
-        git remote remove vllm-upstream >/dev/null 2>&1 || true; \
-        git remote add vllm-upstream "$VLLM_UPSTREAM_REPO"; \
-        git fetch vllm-upstream +refs/heads/main:refs/remotes/vllm-upstream/main; \
+        VLLM_HAS_NUMERIC_PRS=""; \
         for pr in $VLLM_ALL_PRS; do \
-            echo "Fetching PR #$pr and applying its patch onto current HEAD..."; \
-            git fetch vllm-upstream +pull/${pr}/head:pr-${pr}; \
-            pr_base="$(git merge-base vllm-upstream/main pr-${pr} || true)"; \
-            if [ -z "$pr_base" ]; then \
-                echo "Unable to find an upstream main merge-base for PR #$pr."; \
+            if printf '%s\n' "$pr" | grep -Eq '^[1-9][0-9]*$'; then \
+                VLLM_HAS_NUMERIC_PRS=1; \
+            fi; \
+        done; \
+        if [ -n "$VLLM_HAS_NUMERIC_PRS" ]; then \
+            echo "Fetching upstream main to calculate numeric PR patch ranges; current checkout remains $VLLM_REF."; \
+            git remote remove vllm-upstream >/dev/null 2>&1 || true; \
+            git remote add vllm-upstream "$VLLM_UPSTREAM_REPO"; \
+            git fetch vllm-upstream +refs/heads/main:refs/remotes/vllm-upstream/main; \
+        fi; \
+        pr_index=0; \
+        for pr in $VLLM_ALL_PRS; do \
+            pr_index=$((pr_index + 1)); \
+            patch_file="/tmp/vllm-pr-${pr_index}.patch"; \
+            if printf '%s\n' "$pr" | grep -Eq '^[1-9][0-9]*$'; then \
+                pr_head="vllm-pr-${pr_index}"; \
+                echo "Fetching upstream vLLM PR #$pr and applying its patch onto current HEAD..."; \
+                git fetch vllm-upstream "+pull/${pr}/head:${pr_head}"; \
+                pr_base="$(git merge-base vllm-upstream/main "$pr_head" || true)"; \
+                if [ -z "$pr_base" ]; then \
+                    echo "Unable to find an upstream main merge-base for PR #$pr."; \
+                    exit 1; \
+                fi; \
+                echo "PR #$pr patch range: $pr_base..$pr_head; apply target: $(git rev-parse HEAD)."; \
+                git diff --binary "$pr_base" "$pr_head" > "$patch_file"; \
+            elif printf '%s\n' "$pr" | grep -Eq '^https://github\.com/[A-Za-z0-9][A-Za-z0-9_.-]*/[A-Za-z0-9][A-Za-z0-9_.-]*/pull/[1-9][0-9]*/?$'; then \
+                pr_url="${pr%/}"; \
+                echo "Fetching vLLM PR from ${pr_url}.diff and applying its patch onto current HEAD..."; \
+                curl -fsSL --retry 3 --retry-delay 1 "${pr_url}.diff" -o "$patch_file"; \
+            else \
+                echo "Invalid vLLM PR reference: $pr" >&2; \
                 exit 1; \
             fi; \
-            patch_file="/tmp/pr-${pr}.patch"; \
-            echo "PR #$pr patch range: $pr_base..pr-${pr}; apply target: $(git rev-parse HEAD)."; \
-            git diff --binary "$pr_base" "pr-${pr}" > "$patch_file"; \
             if [ ! -s "$patch_file" ]; then \
-                echo "PR #$pr has no patch relative to upstream main; skipping."; \
+                echo "vLLM PR $pr has no patch; skipping."; \
                 rm -f "$patch_file"; \
                 continue; \
             fi; \
             if git apply --reverse --check --binary "$patch_file" >/dev/null 2>&1; then \
-                echo "PR #$pr patch is already applied to HEAD; skipping."; \
+                echo "vLLM PR $pr patch is already applied to HEAD; skipping."; \
                 rm -f "$patch_file"; \
                 continue; \
             fi; \
             if git apply --3way --index --binary "$patch_file"; then \
                 if git diff --cached --quiet; then \
-                    echo "PR #$pr patch produced no staged changes; skipping."; \
+                    echo "vLLM PR $pr patch produced no staged changes; skipping."; \
                 else \
-                    git commit -m "Apply vLLM PR #${pr}"; \
+                    git commit -m "Apply vLLM PR ${pr}"; \
                 fi; \
                 rm -f "$patch_file"; \
             else \
@@ -472,27 +527,27 @@ RUN set -eux; \
                     esac; \
                 done; \
                 if [ -z "$conflict_files" ]; then \
-                    echo "PR #$pr patch failed without unmerged files."; \
+                    echo "vLLM PR $pr patch failed without unmerged files."; \
                     rm -f "$patch_file"; \
                     git reset --hard HEAD; \
                     exit 1; \
                 fi; \
                 if [ -n "$code_conflicts" ]; then \
-                    echo "PR #$pr has code patch conflicts: $code_conflicts"; \
+                    echo "vLLM PR $pr has code patch conflicts: $code_conflicts"; \
                     rm -f "$patch_file"; \
                     git reset --hard HEAD; \
                     exit 1; \
                 fi; \
-                echo "Skipping tests/docs conflicts for PR #$pr: $conflict_files"; \
+                echo "Skipping tests/docs conflicts for vLLM PR $pr: $conflict_files"; \
                 for conflict_file in $conflict_files; do \
                     git checkout --ours -- "$conflict_file"; \
                     git add "$conflict_file"; \
                 done; \
                 if git diff --cached --quiet; then \
-                    echo "PR #$pr only changed conflicting tests/docs files; skipping."; \
+                    echo "vLLM PR $pr only changed conflicting tests/docs files; skipping."; \
                     git reset --hard HEAD; \
                 else \
-                    git commit -m "Apply vLLM PR #${pr}"; \
+                    git commit -m "Apply vLLM PR ${pr}"; \
                 fi; \
                 rm -f "$patch_file"; \
             fi; \
@@ -509,6 +564,23 @@ RUN set -eux; \
 # It is also safe for older refs (backend absent) and refs that already contain
 # the fix (idempotent); unknown partial source shapes fail the build.
 COPY docker/patch_vllm_*.py docker/pin_cutlass_dsl.py /tmp/vllm-patches/
+
+# TEMPORARY PATCH: vLLM PR #53007 / d29c88f162a3 chooses a large SWA
+# kernel block even when the backend cannot run the primary block unsplit.
+# On FlashInfer SM12x, 64 does not divide Qwen3.8's 1648-token page, so
+# DFlash2 pages become mostly padding. Preserve the PR's supported-primary
+# path and restore the smallest-block fallback. Remove once supported refs
+# contain an equivalent upstream fix; unexpected source layouts fail closed.
+RUN python3 /tmp/vllm-patches/patch_vllm_swa_block_size.py .
+
+# TEMPORARY PATCH: vLLM PR #53306 added a preliminary CUDA-graph memory
+# profiling capture, but only redirects the main graph manager and existing
+# wrappers to its throwaway pool. MTP and other autoregressive speculators own
+# separate prefill/decode managers, so their discarded profiling graphs can
+# invalidate the persistent global pool before the real FULL capture. Keep all
+# speculator managers in the throwaway pool until the oldest supported ref has
+# the equivalent upstream fix.
+RUN python3 /tmp/vllm-patches/patch_vllm_mrv2_speculator_cudagraph_pool.py .
 
 # TEMPORARY PATCH: local-inference-lab/vllm commit ad848fc41 added a dynamic
 # DeepSeek V4 C128A top-k width but omitted the alignment constant import.
@@ -606,6 +678,9 @@ RUN python3 /tmp/vllm-patches/patch_vllm_routed_experts_weight_shape.py .
 # reservations behind just before vLLM sizes and allocates KV cache blocks.
 RUN python3 /tmp/vllm-patches/patch_vllm_spark_kv_cache_cleanup.py .
 
+# WSL guest RAM does not describe CUDA's allocation budget on UMA devices.
+# Keep the fix in exported wheels as well as the runner below.
+RUN python3 /tmp/vllm-patches/patch_vllm_wsl_cuda_uma.py .
 
 # Prepare build requirements
 RUN --mount=type=cache,id=uv-cache,target=/root/.cache/uv \
@@ -666,6 +741,7 @@ ARG CUTLASS_DSL_VERSION
 ARG B12X_REPO
 ARG B12X_REF
 ARG B12X_CACHEBUST
+ARG B12X_FROM_PYPI
 
 # Transferring build settings from build image because of ptxas/jit compilation during vLLM startup
 # Build parallemism
@@ -710,7 +786,7 @@ RUN --mount=type=bind,from=base,source=/workspace/vllm/nccl/build/pkg/deb,target
     python3 python3-pip python3-dev vim curl git wget \
     libcudnn9-cuda-13 \
     libibverbs1 libibverbs-dev rdma-core \
-    libxcb1 earlyoom \
+    libxcb1 earlyoom liburing-dev pkg-config \
     && cd /workspace/nccl-pkg && apt install -y --no-install-recommends --allow-downgrades --allow-change-held-packages ./*.deb \
     && rm -rf /var/lib/apt/lists/* \
     && pip install uv
@@ -777,6 +853,10 @@ ENV FLASHINFER_CUDA_ARCH_LIST=${FLASHINFER_CUDA_ARCH_LIST}
 ENV TRITON_PTXAS_PATH=/usr/local/cuda/bin/ptxas
 ENV TIKTOKEN_ENCODINGS_BASE=$VLLM_BASE_DIR/tiktoken_encodings
 ENV PATH=$VLLM_BASE_DIR:$PATH
+# Enable vLLM's WSL2 pinned-memory path; override with -e VLLM_WSL2_ENABLE_PIN_MEMORY=0.
+ENV VLLM_WSL2_ENABLE_PIN_MEMORY=1
+# TODO: Make the B12X autotuning default architecture dependent.
+ENV B12X_AUTOTUNE=0
 
 
 # Final extra deps
@@ -796,28 +876,55 @@ RUN --mount=type=cache,id=uv-cache,target=/root/.cache/uv \
         --extra-index-url https://download.pytorch.org/whl/cu130 \
         --index-strategy unsafe-best-match
 
-# The local-inference-lab vLLM fork consumes the external B12X kernel package
-# at runtime. Keep this opt-in so ordinary vLLM images do not pull a
-# package that requires Torch 2.12+. Build B12X from its source repository but
-# install it without dependencies: vLLM already provides the runtime packages
-# and this image deliberately advances nvidia-cutlass-dsl to 4.7.0 for both
+# Upstream vLLM and the local-inference-lab fork consume the external B12X
+# kernel package at runtime. Regular builds use the latest PyPI release;
+# experimental fork builds use source. Install without dependencies: vLLM
+# already provides the runtime packages, and this image deliberately advances
+# nvidia-cutlass-dsl to 4.7.0 for both
 # regular and B12X builds. B12X kernels remain JIT-compiled on first use;
 # building its Python wheel here does not compile the CUDA kernels.
 COPY docker/pin_cutlass_dsl.py /tmp/pin_cutlass_dsl.py
+# TEMPORARY: restore small-tile W4A8 occupancy until B12X PR #363 is merged.
+# https://github.com/local-inference-lab/b12x/pull/363
+# Bundled from commit 9dc276f8105cfbe2d5882a6475e6e96c9533911c.
+COPY docker/b12x-pr363-small-tile-barriers.patch /tmp/b12x-pr363.patch
 RUN --mount=type=cache,id=uv-cache,target=/root/.cache/uv \
     if [ -n "$B12X_REPO" ]; then \
         echo "Refreshing B12X source (cache key: $B12X_CACHEBUST)" && \
         git clone --depth 1 --branch "$B12X_REF" "$B12X_REPO" /tmp/b12x-source && \
         B12X_COMMIT=$(git -C /tmp/b12x-source rev-parse HEAD) && \
+        if git -C /tmp/b12x-source apply --reverse --check /tmp/b12x-pr363.patch >/dev/null 2>&1; then \
+            echo "B12X PR #363 is already applied; skipping."; \
+        elif git -C /tmp/b12x-source apply --check /tmp/b12x-pr363.patch; then \
+            git -C /tmp/b12x-source apply /tmp/b12x-pr363.patch && \
+            echo "Applied B12X PR #363 small-tile W4A8 barrier specialization."; \
+        else \
+            echo "B12X PR #363 does not match this source; review the temporary patch before building." >&2; \
+            exit 1; \
+        fi && \
         python3 /tmp/pin_cutlass_dsl.py "$CUTLASS_DSL_VERSION" \
             --expected-count 5 /tmp/b12x-source/pyproject.toml && \
         uv pip install --reinstall --no-deps /tmp/b12x-source && \
         printf '%s\n' "$B12X_COMMIT" > /workspace/b12x-source-commit && \
         python3 -c "import importlib.metadata as m, sys; import b12x; print('Verified B12X', m.version('b12x'), 'from source commit', sys.argv[1], 'with CUTLASS DSL', m.version('nvidia-cutlass-dsl'))" "$B12X_COMMIT" && \
         rm -rf /tmp/b12x-source; \
+    elif [ "$B12X_FROM_PYPI" = "1" ]; then \
+        echo "Refreshing B12X from PyPI (cache key: $B12X_CACHEBUST)" && \
+        uv pip install --upgrade --refresh-package b12x --no-deps --index-url https://pypi.org/simple b12x && \
+        python3 -c "import importlib.metadata as m; import b12x; print('Verified B12X', m.version('b12x'), 'from PyPI with CUTLASS DSL', m.version('nvidia-cutlass-dsl'))"; \
     else \
-        echo "B12X source build not requested; skipping."; \
+        echo "B12X installation not requested; skipping."; \
     fi
+
+# Cached or downloaded wheels can predate the CUDA-on-WSL reporting fix.
+# This also accepts wheels that already contain the source-stage patch.
+COPY docker/patch_vllm_wsl_cuda_uma.py /tmp/vllm-patches/patch_vllm_wsl_cuda_uma.py
+RUN python3 /tmp/vllm-patches/patch_vllm_wsl_cuda_uma.py --installed
+
+# Enumerate Torch schema arguments once per fill_defaults call. Apply after all
+# package installs so regular, B12X, and precompiled-wheel runners retain the fix.
+COPY docker/patch_torch_schema_enumeration.py /tmp/torch-patches/patch_torch_schema_enumeration.py
+RUN python3 /tmp/torch-patches/patch_torch_schema_enumeration.py --installed
 
 # Fix NCCL
 RUN rm /usr/local/lib/python3.12/dist-packages/nvidia/nccl/lib/libnccl.so.2 && \
